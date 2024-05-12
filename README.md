@@ -28,7 +28,7 @@ learning tasks. We evaluate NetDiffus on seven diverse traffic traces and show
 that utilizing synthetic data significantly improves several downstream ML tasks
 including traffic fingerprinting, anomaly detection and traffic classification.
 
-<img src="img.png" width="700">
+<img src="img.png">
 
 We have released the data for the purpose of re-implementing and testing the algoirhtm [here](https://drive.google.com/drive/folders/1qoNrghez1vffgApGe9SnUXSzV9fx6unz?usp=sharing). This dataset is not the complete one. Complete dataset will be available upon the request.
 
