@@ -28,8 +28,36 @@ learning tasks. We evaluate NetDiffus on seven diverse traffic traces and show
 that utilizing synthetic data significantly improves several downstream ML tasks
 including traffic fingerprinting, anomaly detection and traffic classification.
 
-![img.png](img.png)
+<img src="img.png" width="700">
 
+We have released the data for the purpose of re-implementing and testing the algoirhtm [here](https://drive.google.com/drive/folders/1qoNrghez1vffgApGe9SnUXSzV9fx6unz?usp=sharing). This dataset is not the complete one. Complete dataset will be available upon the request.
+
+
+    Data structure for data generationn is as follows:
+    - Youtube
+        -vid1
+            -vid1_1.png
+            -vid1_2.png
+            - ...
+        -vid2
+            - ...
+        - ...
+
+# Run Scripts
+
+To start the training process you can run the following command:
+
+```commandline
+ python scripts/image_train.py --data_dir Youtube --image_size 128 --num_channels 128 --num_res_blocks 3 --diffusion_steps 1000 --noise_schedule cosine --learn_sigma True --class_cond True --rescale_learned_sigmas False --rescale_timesteps False --lr 1e-4 --batch_size 4
+```
+
+To generate the data you can run the following command:
+
+```commandline
+  python scripts/image_sample.py --model_path output/ema_0.9999_1280000.pt --image_size 128 --num_channels 128 --num_res_blocks 3 --diffusion_steps 1000 --noise_schedule cosine --learn_sigma True --class_cond True --rescale_learned_sigmas False --rescale_timesteps False
+```
+
+You can run the classifier.py to get the classification results.
 
 # Acknowledgements
 This code is developed on the OpenAI's [Guided Diffusion](https://github.com/openai/guided-diffusion).
