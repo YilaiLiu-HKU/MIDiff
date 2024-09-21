@@ -32,6 +32,10 @@ including traffic fingerprinting, anomaly detection and traffic classification.
 
 We have released the data for the purpose of re-implementing and testing the algoirhtm [here](https://drive.google.com/drive/folders/1qoNrghez1vffgApGe9SnUXSzV9fx6unz?usp=sharing). This dataset is not the complete one. Complete dataset will be available upon the request.
 
+Run the command below to convert the extracted features in the csv files to GASF images.
+```commandline
+ python gasf_conversion.py
+```
 
     Data structure for data generationn is as follows:
     - Youtube
