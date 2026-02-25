@@ -6,7 +6,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-
+from triple_attention import TripletAttention
 from fp16_util import convert_module_to_f16, convert_module_to_f32
 from nn import (
     checkpoint,
@@ -17,8 +17,185 @@ from nn import (
     normalization,
     timestep_embedding,
 )
+#ckpt=/home/yilai/projects/poster/NetDiffus/ckpt/tiff/ema_0.9999_058000.pt
+# =================================================================
+# ===== 在 unet.py 中添加以下两个新类 =====
+# =================================================================
+class SparseAxialMLP(nn.Module):
+    """
+    稀疏轴向 MLP：分别沿 H、W 两个轴做 token-mixing（全局建模），
+    通过低秩瓶颈 (H -> H//r -> H, W -> W//r -> W) 减少参数量。
+    - 权重对每个通道共享（与 C 无关），从而是“稀疏”的全局连接。
+    - 需要固定的 H、W。
+    """
+    def __init__(self, H: int, W: int, reduction: int = 4, dropout: float = 0.0):
+        super().__init__()
+        assert H > 1 and W > 1
+        self.H, self.W = H, W
+        h_mid = max(1, H // reduction)
+        w_mid = max(1, W // reduction)
+
+        # 沿 H 轴的 mixing： (B, C, H, W) -> 对每个列（W 个）上的 H 序列做 MLP
+        self.h_fc1 = nn.Parameter(th.randn(H, h_mid) * (2.0 / (H + h_mid))**0.5)
+        self.h_fc2 = nn.Parameter(th.randn(h_mid, H) * (2.0 / (h_mid + H))**0.5)
+
+        # 沿 W 轴的 mixing： (B, C, H, W) -> 对每个行（H 个）上的 W 序列做 MLP
+        self.w_fc1 = nn.Parameter(th.randn(W, w_mid) * (2.0 / (W + w_mid))**0.5)
+        self.w_fc2 = nn.Parameter(th.randn(w_mid, W) * (2.0 / (w_mid + W))**0.5)
+
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+        # 可选：轴向比例门控，平衡两条支路
+        self.h_gate = nn.Parameter(th.tensor(0.5))
+        self.w_gate = nn.Parameter(th.tensor(0.5))
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        x: (B, C, H, W)
+        returns: (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        assert H == self.H and W == self.W, "输入空间分辨率需与初始化时一致"
+
+        # ---- H 轴 mixing ----
+        x_h = x.permute(0, 3, 1, 2).contiguous().view(B * W * C, H)
+        x_h = x_h @ self.h_fc1
+        x_h = self.act(x_h)
+        x_h = self.drop(x_h)
+        x_h = x_h @ self.h_fc2
+        x_h = x_h.view(B, W, C, H).permute(0, 2, 3, 1).contiguous()
+
+        # ---- W 轴 mixing ----
+        x_w = x.permute(0, 2, 1, 3).contiguous().view(B * H * C, W)
+        x_w = x_w @ self.w_fc1
+        x_w = self.act(x_w)
+        x_w = self.drop(x_w)
+        x_w = x_w @ self.w_fc2
+        x_w = x_w.view(B, H, C, W).permute(0, 2, 1, 3).contiguous()
+
+        out = self.h_gate.tanh() * x_h + self.w_gate.tanh() * x_w
+        return out
+class SparseMLPBlock(nn.Module):
+    """
+    一个改进版的 SparseMLP Block，增加了局部处理层。
+    """
+    def __init__(self, C: int, H: int, W: int, expansion: int = 4, dropout: float = 0.0):
+        super().__init__()
+        mid = C * expansion
+        self.norm = nn.LayerNorm(C)
+
+        self.pre_proj = nn.Conv2d(C, mid, kernel_size=1)
+        
+        # 新增：一个用于提取局部特征的深度卷积层
+        self.local_conv = nn.Conv2d(mid, mid, kernel_size=3, padding=1, groups=mid)
+        
+        self.sparse_mlp = SparseAxialMLP(H=H, W=W, reduction=4, dropout=dropout)
+        self.post_proj = nn.Conv2d(mid, C, kernel_size=1)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        B, C, H, W = x.shape
+        residual = x
+        
+        x_tok = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
+        x_tok = self.norm(x_tok)
+        x = x_tok.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+
+        x = self.pre_proj(x)
+        
+        # 在全局混合之前，先通过局部卷积
+        # 为卷积也增加一个残差连接，使其成为可选的特征增强
+        x = self.local_conv(x) + x 
+        
+        x = self.sparse_mlp(x)
+        x = self.post_proj(x)
+        x = self.drop(x)
+
+        return residual + x
+
+class PixelRefiner(nn.Module):
+    """
+    使用 SparseMLP 模块独立微调每行像素值的模块。
+    """
+    def __init__(self, in_channels, H, W, depth=2, expansion=4, dropout=0.1):
+        super().__init__()
+        self.H = H
+        self.W = W
+        blocks = []
+        for _ in range(depth):
+            blocks.append(
+                SparseMLPBlock(
+                    C=in_channels, H=H, W=W, expansion=expansion, dropout=dropout
+                )
+            )
+        
+        # 添加一个最终的1x1卷积层
+        final_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        
+        # 将其权重和偏置初始化为零
+        with th.no_grad():
+            final_conv.weight.zero_()
+            final_conv.bias.zero_()
+            
+        blocks.append(final_conv)
+        
+        self.blocks = nn.Sequential(*blocks)
 
 
+    def forward(self, x):
+        return self.blocks(x)
+class AntiAliasDownsample(nn.Module):
+    """
+    使用模糊核进行抗混叠处理的下采样模块。
+    """
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, k=3):
+        super().__init__()
+        if dims != 2:
+            raise NotImplementedError("AntiAliasDownsample currently only supports 2D.")
+        
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        
+        # 模糊层，用于抗混叠
+        pad = (k - 1) // 2
+        self.blur = nn.Conv2d(self.channels, self.channels, k, stride=1, padding=pad,
+                              groups=self.channels, bias=False)
+        with th.no_grad():
+            # 初始化为均匀模糊核
+            nn.init.constant_(self.blur.weight, 1.0 / (k * k))
+            
+        # 投影层，执行下采样
+        self.proj = conv_nd(dims, self.channels, self.out_channels, 3, stride=2, padding=1)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        # 先模糊，再进行带步长的卷积下采样
+        return self.proj(self.blur(x))
+
+
+class PixelShuffleUpsample(nn.Module):
+    """
+    使用 PixelShuffle 的上采样模块，通常效果更平滑。
+    """
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, scale=2):
+        super().__init__()
+        if dims != 2:
+            raise NotImplementedError("PixelShuffleUpsample currently only supports 2D.")
+            
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        
+        # 1x1卷积，将通道数扩展到 (scale*scale) 倍
+        self.proj = conv_nd(dims, self.channels, self.out_channels * (scale ** 2), 1)
+        self.ps = nn.PixelShuffle(scale)
+        # 3x3卷积，用于平滑特征
+        self.smooth = conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        x = self.ps(self.proj(x))
+        return self.smooth(x)
 class AttentionPool2d(nn.Module):
     """
     Adapted from CLIP: https://github.com/openai/CLIP/blob/main/clip/model.py
@@ -395,33 +572,7 @@ class QKVAttention(nn.Module):
 
 class UNetModel(nn.Module):
     """
-    The full UNet model with attention and timestep embedding.
-
-    :param in_channels: channels in the input Tensor.
-    :param model_channels: base channel count for the model.
-    :param out_channels: channels in the output Tensor.
-    :param num_res_blocks: number of residual blocks per downsample.
-    :param attention_resolutions: a collection of downsample rates at which
-        attention will take place. May be a set, list, or tuple.
-        For example, if this contains 4, then at 4x downsampling, attention
-        will be used.
-    :param dropout: the dropout probability.
-    :param channel_mult: channel multiplier for each level of the UNet.
-    :param conv_resample: if True, use learned convolutions for upsampling and
-        downsampling.
-    :param dims: determines if the signal is 1D, 2D, or 3D.
-    :param num_classes: if specified (as an int), then this model will be
-        class-conditional with `num_classes` classes.
-    :param use_checkpoint: use gradient checkpointing to reduce memory usage.
-    :param num_heads: the number of attention heads in each attention layer.
-    :param num_heads_channels: if specified, ignore num_heads and instead use
-                               a fixed channel width per attention head.
-    :param num_heads_upsample: works with num_heads to set a different number
-                               of heads for upsampling. Deprecated.
-    :param use_scale_shift_norm: use a FiLM-like conditioning mechanism.
-    :param resblock_updown: use residual blocks for up/downsampling.
-    :param use_new_attention_order: use a different attention pattern for potentially
-                                    increased efficiency.
+    The full UNet model with configurable attention: 'origin', 'triple', 'both'.
     """
 
     def __init__(
@@ -445,9 +596,16 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+        attention_type='origin',  # 'origin', 'triple', 'both'
+        backbone_type='resnet',  # 'resnet' or 'dit'
+        use_pixel_refiner=False,  # 是否在输出端使用 PixelRefiner
+  # 'unet' or 'dit'
     ):
         super().__init__()
-
+        assert attention_type in ('origin', 'triple', 'both'), \
+            "attention_type must be 'origin', 'triple', or 'both'"
+        self.attention_type = attention_type
+        self.use_pixel_refiner = use_pixel_refiner
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
 
@@ -466,6 +624,9 @@ class UNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
+        self.use_scale_shift_norm = use_scale_shift_norm
+        self.resblock_updown = resblock_updown
+        self.use_new_attention_order = use_new_attention_order
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -474,13 +635,14 @@ class UNetModel(nn.Module):
             linear(time_embed_dim, time_embed_dim),
         )
 
-        if self.num_classes is not None:
+        if num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
-
+        print(dims)
+        print(in_channels)
         ch = input_ch = int(channel_mult[0] * model_channels)
-        self.input_blocks = nn.ModuleList(
-            [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
-        )
+        self.input_blocks = nn.ModuleList([
+            TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))
+        ])
         self._feature_size = ch
         input_block_chans = [ch]
         ds = 1
@@ -499,15 +661,20 @@ class UNetModel(nn.Module):
                 ]
                 ch = int(mult * model_channels)
                 if ds in attention_resolutions:
-                    layers.append(
-                        AttentionBlock(
-                            ch,
-                            use_checkpoint=use_checkpoint,
-                            num_heads=num_heads,
-                            num_head_channels=num_head_channels,
-                            use_new_attention_order=use_new_attention_order,
+                    # origin attention
+                    if attention_type in ('origin', 'both'):
+                        layers.append(
+                            AttentionBlock(
+                                ch,
+                                num_heads=num_heads,
+                                num_head_channels=num_head_channels,
+                                use_checkpoint=use_checkpoint,
+                                use_new_attention_order=use_new_attention_order,
+                            )
                         )
-                    )
+                    # triple attention
+                    if attention_type in ('triple', 'both'):
+                        layers.append(TripletAttention(gate_channels=ch))
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
                 input_block_chans.append(ch)
@@ -524,11 +691,8 @@ class UNetModel(nn.Module):
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             down=True,
-                        )
-                        if resblock_updown
-                        else Downsample(
-                            ch, conv_resample, dims=dims, out_channels=out_ch
-                        )
+                        ) if resblock_updown else
+                        Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
                 )
                 ch = out_ch
@@ -536,7 +700,8 @@ class UNetModel(nn.Module):
                 ds *= 2
                 self._feature_size += ch
 
-        self.middle_block = TimestepEmbedSequential(
+        # middle block
+        mid_layers = [
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -544,14 +709,21 @@ class UNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
-            ),
-            AttentionBlock(
-                ch,
-                use_checkpoint=use_checkpoint,
-                num_heads=num_heads,
-                num_head_channels=num_head_channels,
-                use_new_attention_order=use_new_attention_order,
-            ),
+            )
+        ]
+        if attention_type in ('origin', 'both'):
+            mid_layers.append(
+                AttentionBlock(
+                    ch,
+                    num_heads=num_heads,
+                    num_head_channels=num_head_channels,
+                    use_checkpoint=use_checkpoint,
+                    use_new_attention_order=use_new_attention_order,
+                )
+            )
+        if attention_type in ('triple', 'both'):
+            mid_layers.append(TripletAttention(gate_channels=ch))
+        mid_layers.append(
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -559,11 +731,13 @@ class UNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
-            ),
+            )
         )
+        self.middle_block = TimestepEmbedSequential(*mid_layers)
         self._feature_size += ch
 
-        self.output_blocks = nn.ModuleList([])
+        # output blocks
+        self.output_blocks = nn.ModuleList()
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
                 ich = input_block_chans.pop()
@@ -580,15 +754,19 @@ class UNetModel(nn.Module):
                 ]
                 ch = int(model_channels * mult)
                 if ds in attention_resolutions:
-                    layers.append(
-                        AttentionBlock(
-                            ch,
-                            use_checkpoint=use_checkpoint,
-                            num_heads=num_heads_upsample,
-                            num_head_channels=num_head_channels,
-                            use_new_attention_order=use_new_attention_order,
+                    if attention_type in ('triple', 'both'):
+                        layers.append(TripletAttention(gate_channels=ch))
+                    if attention_type in ('origin', 'both'):
+                        layers.append(
+                            AttentionBlock(
+                                ch,
+                                num_heads=num_heads_upsample,
+                                num_head_channels=num_head_channels,
+                                use_checkpoint=use_checkpoint,
+                                use_new_attention_order=use_new_attention_order,
+                            )
                         )
-                    )
+                    
                 if level and i == num_res_blocks:
                     out_ch = ch
                     layers.append(
@@ -601,68 +779,186 @@ class UNetModel(nn.Module):
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             up=True,
-                        )
-                        if resblock_updown
-                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
+                        ) if resblock_updown else
+                        Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
                     ds //= 2
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
-
+        actual_channels = self.model_channels * self.channel_mult[-1]
         self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
-
-    def convert_to_fp16(self):
-        """
-        Convert the torso of the model to float16.
-        """
-        self.input_blocks.apply(convert_module_to_f16)
-        self.middle_block.apply(convert_module_to_f16)
-        self.output_blocks.apply(convert_module_to_f16)
-
-    def convert_to_fp32(self):
-        """
-        Convert the torso of the model to float32.
-        """
-        self.input_blocks.apply(convert_module_to_f32)
-        self.middle_block.apply(convert_module_to_f32)
-        self.output_blocks.apply(convert_module_to_f32)
+        #self.max_value_head = PixelMaxPredictor(actual_channels, expansion=8, heads=8)
+        #self.row_predictor = RowPredictor(self.out_channels, expansion=8, heads=8)
+        if self.use_pixel_refiner:
+            self.pixel_refiner = PixelRefiner(out_channels, image_size, 160)
 
     def forward(self, x, timesteps, y=None):
-        """
-        Apply the model to an input batch.
-
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-        assert (y is not None) == (
-            self.num_classes is not None
-        ), "must specify y if and only if the model is class-conditional"
-
+        
+        assert (y is not None) == (self.num_classes is not None),"must specify y if and only if the model is class-conditional"
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-
         if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
-
         h = x.type(self.dtype)
+        #import pdb;pdb.set_trace()
         for module in self.input_blocks:
+            
             h = module(h, emb)
             hs.append(h)
         h = self.middle_block(h, emb)
+        #print(h.shape)
+        #max_pred = self.max_value_head(h).squeeze(-1)
+        #print(x.shape)
+        #import pdb;pdb.set_trace()
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)
-        return self.out(h)
+        out = self.out(h)
+        #print(h.shape)
+        #aux_out = self.aux_head_new(h)
+        #row_predictions = self.row_predictor(out)
+        if self.use_pixel_refiner:
+            out = out + self.pixel_refiner(out)
+        return out, None
+
+class RowPredictor(nn.Module):
+    """
+    预测每一行的特征值的模块
+    """
+    def __init__(self, in_channels, expansion=4, heads=8):
+        super().__init__()
+        mid_channels = in_channels * expansion
+        
+        # 空间信息提取
+        self.spatial_process = nn.Sequential(
+            # 使用深度可分离卷积处理空间信息
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels),
+            nn.Conv2d(in_channels, mid_channels, 1),
+            # 使用实例归一化代替层归一化
+            nn.InstanceNorm2d(mid_channels),
+            nn.GELU()
+        )
+        
+        # 行注意力模块
+        self.row_attention = nn.Sequential(
+            nn.Conv2d(mid_channels, mid_channels, (1, 3), padding=(0, 1), groups=mid_channels),
+            nn.Conv2d(mid_channels, mid_channels, 1),
+            nn.InstanceNorm2d(mid_channels),
+            nn.GELU()
+        )
+        
+        # 通道注意力
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(mid_channels, mid_channels // 4, 1),
+            nn.GELU(),
+            nn.Conv2d(mid_channels // 4, mid_channels, 1),
+            nn.Sigmoid()
+        )
+        
+        # 多头自注意力处理每一行
+        self.norm = nn.LayerNorm(mid_channels)  # 这个LayerNorm是正确的，因为它用在重塑后的特征上
+        self.self_attention = nn.MultiheadAttention(mid_channels, heads, batch_first=True)
+        
+        # 最终的预测头
+        self.pred_head = nn.Sequential(
+            nn.Linear(mid_channels, mid_channels // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(mid_channels // 2, 1)
+        )
+
+        # 初始化参数
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        # 1. 空间特征提取
+        feat = self.spatial_process(x)
+        
+        # 2. 行注意力
+        row_weights = self.row_attention(feat)
+        feat = feat * row_weights
+        
+        # 3. 通道注意力
+        channel_weights = self.channel_attention(feat)
+        feat = feat * channel_weights
+        
+        # 4. 转换维度用于自注意力 [B, C, H, W] -> [B*H, W, C]
+        feat = feat.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+        feat = feat.reshape(B*H, W, -1)  # [B, H, W, C] -> [B*H, W, C]
+        
+        # 5. 应用自注意力
+        feat = self.norm(feat)
+        feat, _ = self.self_attention(feat, feat, feat)
+        
+        # 6. 池化得到每行的表示
+        feat = feat.mean(dim=1)  # [B*H, W, C] -> [B*H, C]
+        
+        # 7. 预测每行的值
+        row_predictions = self.pred_head(feat)  # [B*H, 1]
+        
+        # 8. 重塑回原始批次大小
+        row_predictions = row_predictions.reshape(B, H)  # [B*H, 1] -> [B, H]
+        return row_predictions
 
 
+class PixelMaxPredictor(nn.Module):
+    def __init__(self, in_channels, expansion=4, heads=8):
+        super().__init__()
+        mid = in_channels * expansion
+
+        self.sep_conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels),
+            nn.Conv2d(in_channels, mid, 1),
+            nn.GELU()
+        )
+
+        # 通道注意力：权重和偏置都用小随机值
+        self.eca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(mid, mid, 1, groups=mid)
+        )
+        nn.init.constant_(self.eca[1].weight, 1e-2)
+        nn.init.constant_(self.eca[1].bias,   0.0)
+
+        self.norm = nn.LayerNorm(mid, eps=1e-3)
+        self.attn = nn.MultiheadAttention(mid, heads, batch_first=True)
+
+        self.to_score = nn.Conv2d(mid, 1, 1)
+        # 关键：权重 kaiming，偏置 0
+        nn.init.kaiming_normal_(self.to_score.weight, nonlinearity='linear')
+        nn.init.zeros_(self.to_score.bias)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        feat = self.sep_conv(x)
+
+        att = self.eca(feat)          # 去掉 Sigmoid，防止全 0
+        feat = feat * att
+
+        feat_flat = feat.flatten(2).transpose(1, 2)
+        feat_flat = self.norm(feat_flat)
+        feat_flat, _ = self.attn(feat_flat, feat_flat, feat_flat)
+        feat = feat_flat.transpose(1, 2).view(B, -1, H, W)
+
+        score = self.to_score(feat)   # 这里先不要 Sigmoid
+        max_pred = score.view(B, -1).max(1, keepdim=True)[0]
+
+        # 在训练早期打印看看是否还是 0
+        if th.isnan(max_pred).any():
+            print("NAN detected!")
+        return max_pred
 class SuperResModel(UNetModel):
     """
     A UNetModel that performs super-resolution.

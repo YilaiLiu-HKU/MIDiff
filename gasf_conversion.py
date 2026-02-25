@@ -24,6 +24,7 @@ for i in range(n):
         for l in data:
             for j in l:
                 pts.append(j)
+        ###把数据点数量通过求和压缩为1/4
         num_of_samples_per_bin = 4  # to bin the video data
         points = []
         for j in range(int(len(pts) / num_of_samples_per_bin)):

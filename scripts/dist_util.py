@@ -5,7 +5,7 @@ Helpers for distributed training.
 import io
 import os
 import socket
-
+from datetime import timedelta
 import blobfile as bf
 from mpi4py import MPI
 import torch as th
@@ -14,18 +14,19 @@ import torch.distributed as dist
 # Change this to reflect your cluster layout.
 # The GPU for a given rank is (rank % GPUS_PER_NODE).
 GPUS_PER_NODE = 8
-
+os.environ["NCCL_DEBUG"] = "WARN"  # 只显示警告级别及以上的日志
+os.environ["NCCL_DEBUG_SUBSYS"] = "INIT,GRAPH" 
 SETUP_RETRY_COUNT = 3
 
-
+os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
 def setup_dist():
     """
     Setup a distributed process group.
     """
     if dist.is_initialized():
         return
-    #os.environ["CUDA_VISIBLE_DEVICES"] = f"{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+    local_rank = MPI.COMM_WORLD.Get_rank() % th.cuda.device_count()
+    th.cuda.set_device(local_rank)
     comm = MPI.COMM_WORLD
     backend = "gloo" if not th.cuda.is_available() else "nccl"
 
@@ -39,7 +40,9 @@ def setup_dist():
 
     port = comm.bcast(_find_free_port(), root=0)
     os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend=backend, init_method="env://")
+    timeout = timedelta(hours=1)
+
+    dist.init_process_group(backend=backend, init_method="env://",timeout=timeout)
 
 
 def dev():

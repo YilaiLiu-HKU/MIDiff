@@ -6,8 +6,9 @@ import inspect
 #from .unet import SuperResModel, UNetModel, EncoderUNetModel
 import gaussian_diffusion as gd
 from respace import SpacedDiffusion, space_timesteps
-from unet import SuperResModel, UNetModel, EncoderUNetModel
-
+from unet import SuperResModel,  EncoderUNetModel
+from dit import DiT
+from smlp import SmlpUnetModel
 NUM_CLASSES = 20
 
 
@@ -63,6 +64,16 @@ def model_and_diffusion_defaults():
         resblock_updown=False,
         use_fp16=False,
         use_new_attention_order=False,
+        attention_type='origin',
+        backbone_type='resnet',
+        backbone='unet',  # 新增参数，可选 'unet' 或 'dit'
+        post_traffic=False,
+        use_heatmap=False,
+        use_pre_routing_bias=False,
+        use_pixel_refiner=False
+       
+     
+
     )
     res.update(diffusion_defaults())
     return res
@@ -76,6 +87,7 @@ def classifier_and_diffusion_defaults():
 
 def create_model_and_diffusion(
     image_size,
+    attention_type,
     class_cond,
     learn_sigma,
     num_channels,
@@ -98,6 +110,14 @@ def create_model_and_diffusion(
     resblock_updown,
     use_fp16,
     use_new_attention_order,
+    backbone_type,
+    backbone,
+    post_traffic=False,
+    use_heatmap=False,
+    use_pre_routing_bias=False,
+    use_pixel_refiner=False,
+    triplet_version='v1',
+    triplet_no_spatial=True
 ):
     model = create_model(
         image_size,
@@ -116,6 +136,15 @@ def create_model_and_diffusion(
         resblock_updown=resblock_updown,
         use_fp16=use_fp16,
         use_new_attention_order=use_new_attention_order,
+        attention_type=attention_type,
+        backbone_type=backbone_type,
+        backbone=backbone,
+        post_traffic=post_traffic,
+        use_heatmap=use_heatmap,
+        use_pre_routing_bias=use_pre_routing_bias,
+        use_pixel_refiner=use_pixel_refiner,
+        triplet_version=triplet_version,
+        triplet_no_spatial=triplet_no_spatial
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -147,6 +176,15 @@ def create_model(
     resblock_updown=False,
     use_fp16=False,
     use_new_attention_order=False,
+    attention_type='origin',
+    backbone_type='resnet',
+    backbone='unet',  # 新增参数，可选 'unet' 或 'dit'
+    post_traffic=False,
+    use_heatmap=False,
+    use_pre_routing_bias=False,
+    use_pixel_refiner=False,
+    triplet_version='v1',  # 新增：TripletAttention版本
+    triplet_no_spatial=True  # 新增：是否使用空间注意力
 ):
     if channel_mult == "":
         if image_size == 512:
@@ -157,6 +195,9 @@ def create_model(
             channel_mult = (1, 1, 2, 3, 4)
         elif image_size == 64:
             channel_mult = (1, 2, 3, 4)
+        #######这里为了满足320再加一个
+        elif image_size==320:
+            channel_mult = (1, 1, 2, 3, 4)
         else:
             raise ValueError(f"unsupported image size: {image_size}")
     else:
@@ -166,25 +207,114 @@ def create_model(
     for res in attention_resolutions.split(","):
         attention_ds.append(image_size // int(res))
 
-    return UNetModel(
-        image_size=image_size,
-        in_channels=3,
-        model_channels=num_channels,
-        out_channels=(3 if not learn_sigma else 6),
-        num_res_blocks=num_res_blocks,
-        attention_resolutions=tuple(attention_ds),
-        dropout=dropout,
-        channel_mult=channel_mult,
-        num_classes=(NUM_CLASSES if class_cond else None),
-        use_checkpoint=use_checkpoint,
-        use_fp16=use_fp16,
-        num_heads=num_heads,
-        num_head_channels=num_head_channels,
-        num_heads_upsample=num_heads_upsample,
-        use_scale_shift_norm=use_scale_shift_norm,
-        resblock_updown=resblock_updown,
-        use_new_attention_order=use_new_attention_order,
-    )
+    if backbone == 'dit':
+        # 检查是否使用TripletAttention
+        if attention_type in ('triplet_replace', 'triplet_add', 'hybrid'):
+            # 使用支持TripletAttention的DiT
+            from dit_with_triplet import DiT as DiTWithTriplet
+            return DiTWithTriplet(
+                input_size=image_size,
+                patch_size=20,
+                in_channels=1,
+                out_channels=(1 if not learn_sigma else 2),
+                hidden_size=num_channels * 4,
+                depth=num_res_blocks * 2,
+                heads=num_heads,
+                mlp_ratio=4.0,
+                drop_path=dropout,
+                use_heatmap=use_heatmap,
+                attention_type=attention_type,
+                triplet_version=triplet_version,
+                triplet_no_spatial=triplet_no_spatial
+            )
+        else:
+            # 使用原始DiT
+            from dit import DiT
+            return DiT(
+                input_size=image_size,
+                patch_size=20,
+                in_channels=1,
+                out_channels=(1 if not learn_sigma else 2),
+                hidden_size=num_channels * 4,
+                depth=num_res_blocks * 2,
+                heads=num_heads,
+                mlp_ratio=4.0,
+                drop_path=dropout,
+                use_heatmap=use_heatmap
+            )
+    elif backbone == 'smlp':
+        return SmlpUnetModel(
+             image_size=image_size,
+             in_channels=1, # 假设输入通道为 1
+             model_channels=num_channels, # 作为 embed_dim
+             out_channels=(1 if not learn_sigma else 2),
+             num_res_blocks=num_res_blocks, # 作为 stages 的深度
+             channel_mult=channel_mult,
+             learn_sigma=learn_sigma,
+             class_cond=class_cond, # 传递但不一定使用
+             use_checkpoint=use_checkpoint,
+             dropout=dropout,
+             use_fp16=use_fp16,
+             patch_size=1,
+             mlp_ratio=3,
+             drop_path_rate=0,
+             # 确保 use_scale_shift_norm 正确传递给 SmlpBasicBlock (如果需要)
+             # SmlpModel 的 __init__ 需要确保接收并处理这个参数
+         )
+    else:  # 默认使用UNet
+        if backbone_type=='resnet':
+            from unet import UNetModel
+            return UNetModel(
+            image_size=image_size,
+            in_channels=1,
+            model_channels=num_channels,
+            out_channels=(1 if not learn_sigma else 2),
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=tuple(attention_ds),
+            dropout=dropout,
+            channel_mult=channel_mult,
+            num_classes=(NUM_CLASSES if class_cond else None),
+            use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample,
+            use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown,
+            use_new_attention_order=use_new_attention_order,
+            attention_type=attention_type,
+            backbone_type=backbone_type,
+            use_pixel_refiner=use_pixel_refiner,
+            #post_traffic=post_traffic,
+            #use_heatmap=use_heatmap
+        )
+
+        else :
+            from poster.NetDiffus.scripts.unet import UNetModel
+            return UNetModel(
+            image_size=image_size,
+            in_channels=1,
+            model_channels=num_channels,
+            out_channels=(1 if not learn_sigma else 2),
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=tuple(attention_ds),
+            dropout=dropout,
+            channel_mult=channel_mult,
+            num_classes=(NUM_CLASSES if class_cond else None),
+            use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample,
+            use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown,
+            use_new_attention_order=use_new_attention_order,
+            attention_type=attention_type,
+            backbone_type=backbone_type,
+            post_traffic=post_traffic,
+            use_heatmap=use_heatmap,
+            use_pre_routing_bias=use_pre_routing_bias
+        )
 
 
 def create_classifier_and_diffusion(
@@ -246,6 +376,9 @@ def create_classifier(
         channel_mult = (1, 1, 2, 3, 4)
     elif image_size == 64:
         channel_mult = (1, 2, 3, 4)
+    ###
+    elif image_size ==320:
+        channel_mult == (1, 1, 2, 3, 4)
     else:
         raise ValueError(f"unsupported image size: {image_size}")
 
@@ -407,6 +540,7 @@ def create_gaussian_diffusion(
         loss_type = gd.LossType.MSE
     if not timestep_respacing:
         timestep_respacing = [steps]
+        
     return SpacedDiffusion(
         use_timesteps=space_timesteps(steps, timestep_respacing),
         betas=betas,

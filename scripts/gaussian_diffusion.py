@@ -7,7 +7,7 @@ Docstrings have been added, as well as DDIM sampling and a new collection of bet
 
 import enum
 import math
-
+import torch.nn.functional as F
 import numpy as np
 import torch as th
 
@@ -123,6 +123,7 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
+        discriminator=None,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -149,7 +150,7 @@ class GaussianDiffusion:
         self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
         self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
         self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
-
+        self.step=0
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         self.posterior_variance = (
             betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
@@ -257,8 +258,9 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
-
+        #
+        model_output,max_prediction= model(x, self._scale_timesteps(t), **model_kwargs)
+        
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
             model_output, model_var_values = th.split(model_output, C, dim=1)
@@ -323,6 +325,7 @@ class GaussianDiffusion:
             "variance": model_variance,
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
+            'max_prediction':max_prediction
         }
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
@@ -436,7 +439,7 @@ class GaussianDiffusion:
                 cond_fn, out, x, t, model_kwargs=model_kwargs
             )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+        return {"sample": sample, "pred_xstart": out["pred_xstart"],"max_prediction":out["max_prediction"]}
 
     def p_sample_loop(
         self,
@@ -469,6 +472,7 @@ class GaussianDiffusion:
         :param progress: if True, show a tqdm progress bar.
         :return: a non-differentiable batch of samples.
         """
+       
         final = None
         for sample in self.p_sample_loop_progressive(
             model,
@@ -482,7 +486,7 @@ class GaussianDiffusion:
             progress=progress,
         ):
             final = sample
-        return final["sample"]
+        return final["sample"],final["max_prediction"]
 
     def p_sample_loop_progressive(
         self,
@@ -754,8 +758,27 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
+        #import pdb;pdb.set_trace()
+      
+        if not hasattr(self, "call_count"):
+            self.call_count = 0
+        self.call_count += 1
         if model_kwargs is None:
             model_kwargs = {}
+        mask = model_kwargs.pop("padding_mask", None)
+        using_MAE = model_kwargs.pop("using_MAE", False)
+        special_weight = model_kwargs.pop('special_weight', 1)
+        special_value = model_kwargs.pop('special_value', None)
+        cos_weight=model_kwargs.pop('cos_weight', 0)
+        max_value=model_kwargs.pop('max_value', None)
+        traffic_target=model_kwargs.pop('traffic',None)
+        post_traffic= model_kwargs.pop('post_traffic',False)
+        use_heatmap=model_kwargs.pop('use_heatmap',False)
+        norm_img=model_kwargs.pop('norm_img',None)
+        use_FFT=model_kwargs.pop('use_FFT',False)
+        discriminator=model_kwargs.pop('discriminator',None)
+        tile_mask=model_kwargs.pop('tile_mask',None)
+        use_pixel_refiner=model_kwargs.pop('use_pixel_refiner',False)
         if noise is None:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
@@ -774,20 +797,22 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+
+            model_output,traffic_prediction = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
             ]:
-                B, C = x_t.shape[:2]
+                B, C, H, W = x_t.shape[:4]
+                
                 assert model_output.shape == (B, C * 2, *x_t.shape[2:])
                 model_output, model_var_values = th.split(model_output, C, dim=1)
                 # Learn the variance using the variational bound, but don't let
                 # it affect our mean prediction.
                 frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
                 terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
+                    model=lambda *args, r=frozen_out: [r,None],
                     x_start=x_start,
                     x_t=x_t,
                     t=t,
@@ -806,11 +831,325 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
-            if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
+            ########这里加入padding mask忽略梯度计算
+      
+            if not using_MAE:
+                diff = (target - model_output) ** 2
             else:
-                terms["loss"] = terms["mse"]
+                diff = th.abs(target - model_output)
+
+
+
+            
+            ####加入余弦损失
+            def fft_mse_loss_with_mask(x, y, mask):
+                """
+                计算仅在mask区域内的频域MSE损失。
+
+                Args:
+                    x (Tensor): 输入图像 [B, C, H, W]
+                    y (Tensor): 目标图像 [B, C, H, W]
+                    mask (Tensor): 掩码 [B, 1, H, W]，其中值为1的地方是感兴趣的区域
+
+                Returns:
+                    Tensor: 频域MSE损失
+                """
+                # 仅保留mask区域的输入和目标
+                x_masked = x * mask.unsqueeze(1)  # 将x中mask外的区域置为0
+                y_masked = y * mask.unsqueeze(1)  # 将y中mask外的区域置为0
+
+                # 计算FFT
+                x_fft = th.fft.fft2(x_masked)  # [B, C, H, W]
+                y_fft = th.fft.fft2(y_masked)  # [B, C, H, W]
+
+                # 计算幅度差的平方（MSE）
+                x_fft_abs = th.abs(x_fft)
+                y_fft_abs = th.abs(y_fft)
+                x_fft_abs=x_fft_abs
+                y_fft_abs=y_fft_abs
+                fft_diff=(x_fft_abs - y_fft_abs) ** 2
+                if mask is not None:
+                    fft_diff=fft_diff*mask  # apply mask
+                    fft_mse = fft_diff.sum() / (mask.sum() * fft_diff.shape[1] + 1e-8)
+                # 计算频域MSE
+            
+
+                return fft_mse
+            def cosine_loss(x, y, reduction='mean'):
+                """
+                计算余弦损失（1 - cos similarity）
+
+                Args:
+                    x (Tensor): shape (batch_size, dim)
+                    y (Tensor): shape (batch_size, dim)
+                    reduction (str): 'mean', 'sum', or 'none'
+
+                Returns:
+                    Tensor: scalar loss or per-sample loss
+                """
+                x_norm = F.normalize(x, p=2, dim=1)
+                y_norm = F.normalize(y, p=2, dim=1)
+                cosine_sim = (x_norm * y_norm).sum(dim=1)
+                loss = 1 - cosine_sim  # 越小越好
+                if reduction == 'mean':
+                    return loss.mean()
+                elif reduction == 'sum':
+                    return loss.sum()
+                else:
+                    return loss
+            #terms['cos']=cosine_loss(model_output,target)
+            np.set_printoptions(threshold=np.inf) 
+            
+            if mask is not None:
+                mask = mask.to(diff.device)
+                #import pdb;pdb.set_trace()
+                # 统一成 (B,1,...) 以便按通道广播
+                if mask.dim() == diff.dim() - 1:
+                    mask = mask.unsqueeze(1)
+                # 现在 mask: (B,1,H,W) 与 diff: (B,C,H,W) 可广播
+
+                if special_weight != 1:
+                    gt = target
+                    # 这里请确认语义：等于还是不等于？
+                    special_mask = (gt != special_value) & (mask > 0.5)  # (B,C,H,W) via broadcast
+                    weights = th.ones_like(diff)
+                    weights[special_mask] = special_weight
+                    masked = diff * mask * weights
+                else:
+                    masked = diff * mask
+
+                # 每个样本的 masked 元素个数 = (mask 扩展到通道以后).sum
+                den = mask.expand_as(diff).sum(dim=(1, 2, 3)).clamp_min(1e-8)  # (B,)
+                mse = masked.flatten(1).sum(dim=1) / den                        # (B,)
+            else:
+                # 约定：mean_flat 返回 (B,)
+                mse = mean_flat(diff)
+            terms["loss"]=0
+            terms["mse"] = mse
+            def binary_weighted_loss(
+                prediction,
+                target,
+                tile_mask,
+                alpha: float = 5.0,
+                beta: float = 1.0,
+                reduction: str = "none",   # "none" | "mean" | "sum"
+            ):
+                """
+                分样本的二元加权L1损失（MAE）。对信号(tail)与背景(head)像素分别求均值后加权。
+                返回值在 batch 维度上不做归约：形状为 (B,)。
+
+                Args:
+                    prediction: (B, C, ...) 或 (B, ...)
+                    target:     与 prediction 同形状
+                    tile_mask:  (B, 1, ...) 或 (B, ...) 或与 prediction 可广播
+                                1 表示信号像素(tail)，0 表示背景(head)
+                    alpha:      tail 权重
+                    beta:       head 权重
+                    reduction:  "none" 返回 (B,)
+                                "mean"/"sum" 会在 batch 维上再做一次归约
+                Returns:
+                    tuple:
+                    total_loss: (B,) 或标量（取决于 reduction）
+                    tail_loss:  (B,) 或标量
+                    head_loss:  (B,) 或标量
+                """
+                # 确保在同一设备与dtype
+                device = prediction.device
+                dtype = prediction.dtype
+                target = target.to(device=device, dtype=dtype)
+                tile_mask = tile_mask.to(device=device, dtype=dtype)
+
+                # 将 mask 扩展到与 prediction 可广播的形状（常见的是补上通道维）
+                # 例：prediction: (B, C, H, W), mask: (B, H, W) -> (B, 1, H, W)
+                while tile_mask.dim() < prediction.dim():
+                    tile_mask = tile_mask.unsqueeze(1)
+
+                diff = (prediction - target)**2
+                head_mask = 1.0 - tile_mask
+
+                # 在除 batch 以外的所有维度上做求和/计数
+                reduce_dims = list(range(1, diff.ndim))
+
+                tail_sum = (diff * tile_mask).sum(dim=reduce_dims)
+                head_sum = (diff * head_mask).sum(dim=reduce_dims)
+
+                # 每个样本内的像素数（避免0除）
+                eps = 1e-8
+                num_tail = tile_mask.sum(dim=reduce_dims).clamp_min(eps)
+                num_head = head_mask.sum(dim=reduce_dims).clamp_min(eps)
+
+                # 每个样本内的均值损失 -> 形状 (B,)
+                tail_loss = tail_sum / num_tail
+                head_loss = head_sum / num_head
+
+                total_loss = alpha * tail_loss + beta * head_loss
+
+                if reduction == "mean":
+                    return total_loss.mean(), tail_loss.mean(), head_loss.mean()
+                elif reduction == "sum":
+                    return total_loss.sum(), tail_loss.sum(), head_loss.sum()
+                else:
+                    # "none"：保留批次维度 (B,)
+                    return total_loss, tail_loss, head_loss
+        
+            if tile_mask is not None:
+                
+                total_loss, tail_loss, head_loss = binary_weighted_loss(model_output, target, tile_mask, alpha=5.0, beta=1.0)
+                terms['loss']+=total_loss
+                terms['tile_tail_loss']=tail_loss
+                terms['tile_head_loss']=head_loss
+            else:
+                terms["loss"] += terms["mse"]
+                #terms['loss']=mse+0.1*mse_tile
+                #terms['loss']=mse
+                #import pdb;pdb.set_trace()
+                #print(f"tile_mse:{mse_tile.item()}")
+
+            #if "vb" in terms:
+                #terms["loss"] =terms["mse"]+cos_weight*terms['cos'] + terms["vb"]
+                
+                #terms["loss"]+=terms["vb"]
+            
+            if discriminator is not None:
+                mse_per_sample = diff.view(B, -1).mean(dim=1)  # (B,) 每个样本的MSE
+
+                # 将 mse 限制在 [0, 1] 范围内，得到每个样本的 p 值
+                p = th.clamp(mse_per_sample.detach(), min=0.0, max=1.0)  # 每个样本独立计算p
+
+                # 为每一行生成一个概率，基于每个样本的 p 值
+                rand_prob = th.rand(B, H, device=norm_img.device)  # 生成一个 [B, H] 的随机数（0到1之间）
+                mask_replace = rand_prob.unsqueeze(1).expand(-1, C, -1)  # 扩展为 (B, C, H)
+
+                # 扩展 p 使其形状为 (B, C, H) 以便进行比较
+                p_expanded = p.view(B, 1, 1).expand(B, C, H)  # 将 p 扩展为 (B, C, H)
+
+                # 用 target 的该行替换 norm_img 中满足条件的行
+                norm_img = th.where(mask_replace.unsqueeze(-1) < p_expanded.unsqueeze(-1), target, norm_img)
+
+                # GAN损失计算
+                real_labels = th.ones(B, C, device=model_output.device)
+                fake_labels = th.zeros(B, C, device=model_output.device)
+
+                real_loss = F.binary_cross_entropy(discriminator(model_output), real_labels)
+                fake_loss = F.binary_cross_entropy(discriminator(norm_img), fake_labels)
+                gan_loss = (real_loss + fake_loss) / 2.0
+
+                terms["gan_loss"] = gan_loss
+                terms["loss"] += 0.1*gan_loss # 根据时间步调整 GAN 损失的权重
+
+            """if post_traffic:
+
+                traffic_diff=(traffic_target - traffic_prediction) ** 2
+                if mask is not None:
+                    traffic_mask=th.all(traffic_target!=0,dim=1).float()
+                    traffic_diff = traffic_diff * traffic_mask.unsqueeze(1)  # apply mask
+                    traffic_mse = traffic_diff.sum() / (traffic_mask.sum() * traffic_diff.shape[1] + 1e-8)  # 每个通道都masked
+                    terms["traffic_mse"]=traffic_mse
+                    terms["loss"] += 0.1*traffic_mse"""
+            """if norm_img is not None:
+                
+                norm_diff=(norm_img - model_output) ** 2
+                if mask is not None:
+                    norm_diff=norm_diff * mask.unsqueeze(1)  # apply mask
+                    norm_mse = norm_diff.sum() / (mask.sum() * norm_diff.shape[1] + 1e-8)  # 每个通道都masked
+                    terms["norm_mse"]=0.02*norm_mse
+                    terms["loss"] += norm_mse"""
+            if norm_img is not None:
+                #import pdb;pdb.set_trace()
+                """norm_res=(target - norm_img).abs().mean(1, keepdim=True)
+                norm_output=(model_output - norm_img).abs().mean(1, keepdim=True)
+                norm_diff=(norm_res - norm_output) ** 2"""
+                """norm_diff=(norm_img - model_output) ** 2
+                if mask is not None:
+                    norm_masked=norm_diff * mask  # apply mask
+                    den = mask.expand_as(norm_diff).sum(dim=(1, 2, 3)).clamp_min(1e-8)  # (B,)
+                    norm_mse = norm_masked.flatten(1).sum(dim=1) / den           # 每个通道都masked
+                    
+                    terms["norm_mse"]=norm_mse
+                    terms["loss"] += 0.005*norm_mse"""
+                if self.model_mean_type == ModelMeanType.PREVIOUS_X:
+                    pred_xstart = self._predict_xstart_from_xprev(x_t=x_t, t=t, xprev=model_output)
+                elif self.model_mean_type == ModelMeanType.START_X:
+                    pred_xstart = model_output
+                else: # ModelMeanType.EPSILON
+                    pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+
+                # 步骤 2: 计算您的批内方差正则化损失 (norm_mse)
+                pred_xstart_clamped = pred_xstart.clamp(-1, 1)
+                avg_img = pred_xstart_clamped.mean(dim=0, keepdim=True)
+                norm_diff = (avg_img - pred_xstart_clamped) ** 2
+
+                if mask is not None:
+                    norm_masked = norm_diff * mask
+                    den = mask.expand_as(norm_masked).sum(dim=(1, 2, 3)).clamp_min(1e-8)
+                    norm_mse = norm_masked.flatten(1).sum(dim=1) / den # 得到形状为 [B,] 的 per-sample loss
+                else:
+                    norm_mse = mean_flat(norm_diff) # 得到形状为 [B,] 的 per-sample loss
+
+                # ------------------- 优化部分开始 -------------------
+                # 步骤 3: 定义一个随 t 变化的权重函数 w(t)
+                # t 是一个形状为 [B,] 的张量，包含了批次中每个样本的时间步
+                # 我们希望 t 越大，权重越小。一个简单的线性衰减函数：
+                # self.num_timesteps 是总的时间步数，例如 1000
+                #weights = 1.0 - (t.float() / self.num_timesteps) 权重从接近1 (t=0) 线性衰减到接近0 (t=999)
+
+                # 为了防止在t=0时过度惩罚，可以再加一个系数或者使用其他函数，例如高斯函数：
+                # mid_point = self.num_timesteps / 2
+                # sigma = self.num_timesteps / 4
+                # weights = torch.exp(-((t.float() - mid_point) ** 2) / (2 * sigma ** 2))
+
+                # 步骤 4: 将权重应用到损失上
+                # weights 的形状是 [B,]，norm_mse 的形状也是 [B,]
+                # 我们先逐元素相乘，然后再求整个批次的平均值
+                total_timesteps = self.num_timesteps
+                weights = th.cos((math.pi / 2) * t.float() / total_timesteps)
+                weights = weights/weights.sum()
+                print(weights)
+                # 步骤 4: 将权重应用到损失上，并计算整个批次的均值
+                # weights 和 norm_mse 都是 [B,] 形状，逐元素相乘后求均值
+                weighted_norm_mse = (weights * norm_mse).sum()
+                # -------------------- 优化部分结束 --------------------
+
+
+                # 步骤 5: 将加权后的正则化损失添加到总损失中
+                reg_strength = 0.01 # 这是一个可以调整的超参数，代表正则化的基础强度
+                terms["diversity_loss"] = weighted_norm_mse
+                terms["loss"] += reg_strength * weighted_norm_mse
+            if use_FFT:
+                fft_mse_loss_value = fft_mse_loss_with_mask(model_output, target, mask)
+                # 将FFT MSE损失加入到总损失
+                
+                terms["fft_mse_loss"] = fft_mse_loss_value
+                terms["loss"] +=0.001 * fft_mse_loss_value
+            """#### ====== 辅助头损失 ====== 误差在10%以内则忽略
+            # max_prediction: [B, 1], x_start: [B, C, H, W]
+              # [B, 1]
+            max_value = max_value.to(max_prediction.device)
+            max_diff = (max_value - max_prediction) ** 2
+            max_mse  = max_diff.mean()   
+            if self.call_count % 10 == 0:
+                max_list = max_value.tolist()
+                pred_list = max_prediction.tolist()
+
+                if not isinstance(max_list, list):
+                    max_list = [max_list]
+                if not isinstance(pred_list, list):
+                    pred_list = [pred_list] # Basic scalar handling
+
+                max_str = [f"{v:.4f}" for v in max_list]
+                pred_str = []
+                for v in pred_list:
+                    if isinstance(v, list) or isinstance(v, tuple):
+                        # Handle nested list/tuple like [value]
+                        pred_str.append(f"{v[0]:.4f}")
+                    else:
+                        # Handle flat list of floats
+                        pred_str.append(f"{v:.4f}")
+
+                print(f"max_value: {max_str} prediction: {pred_str}")
+
+            terms["aux_loss"] = 0.1 * max_mse
+            terms["loss"] = terms["mse"] + terms["aux_loss"]"""
         else:
             raise NotImplementedError(self.loss_type)
 
