@@ -13,11 +13,10 @@ MIDiff is a diffusion-based framework for generating user-level mobile usage tra
 ```bash
 git clone https://github.com/YilaiLiu-HKU/MIDiff.git
 cd MIDiff
-python -m pip install -e .
-python -m pip install numpy pandas scipy scikit-learn matplotlib seaborn openpyxl tqdm blobfile
+python -m pip install -r requirements.txt
 ```
 
-The code is based on OpenAI Guided Diffusion and PyTorch.
+The requirements file is a minimal list filtered from the `posster` environment for this repository. The code is script-based and is intended to be run from the repository root. It is based on OpenAI Guided Diffusion and PyTorch.
 
 ## Dataset
 
@@ -34,6 +33,12 @@ ckpt/midiff/
 ```
 
 `data/our.csv` is the real/reference CSV in flattened `[192, 3]` eval format, and `cgasf/` contains C-GASF training images.
+
+The paper checkpoint is hosted on Hugging Face and is not stored in Git. Download it with:
+
+```bash
+huggingface-cli download no-pressure/MIDiff ckpt/midiff/ema_0.9999_048000.pt --local-dir .
+```
 
 ## Usage
 
