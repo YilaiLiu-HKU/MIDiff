@@ -46,8 +46,8 @@ The `samples/` directory contains a 5-sample perturbed toy subset for checking t
 
 ```text
 samples/sample_all_users_data_with6cluster_5.npz
-  Category_ID_Traffic (Byte): [5, 288, 20]
-  poi_labels: [5, 288, 7]
+  Category_ID_Traffic (Byte): [5, 192, 20]
+  poi_labels: [5, 192, 7]
 samples/sample_all_users_data_with6cluster_5.csv
 samples/cgasf/
 ```
