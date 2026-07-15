@@ -180,7 +180,211 @@ class AttentionPool2d(nn.Module):
         return x[:, :, 0]
 
 
-from moe_block import TimestepBlock
+class TimestepBlock(nn.Module):
+    """
+    Any module where forward() takes timestep embeddings as a second argument.
+    """
+
+    @abstractmethod
+    def forward(self, x, emb, **kwargs):
+        """
+        Apply the module to `x` given `emb` timestep embeddings.
+        """
+
+
+class ExpertMLP(nn.Module):
+    """Single MLP expert used by the optional MoE backbone block."""
+
+    def __init__(self, in_channels, hidden_dim, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, in_channels),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class HeatmapProcessor(nn.Module):
+    """Encode an optional heatmap into a conditioning vector for routing."""
+
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.processor = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(16, 64, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, hidden_size, 1),
+        )
+
+    def forward(self, heatmap):
+        features = self.processor(heatmap)
+        return th.mean(features, dim=(2, 3))
+
+
+class Router(nn.Module):
+    """Token router for the optional MoE backbone block."""
+
+    def __init__(self, input_dim, num_experts, condition_dim=None, use_pre_routing_bias=False):
+        super().__init__()
+        self.num_experts = num_experts
+        self.use_pre_routing_bias = use_pre_routing_bias
+        self.base_router = nn.Linear(input_dim, num_experts)
+
+        if condition_dim is not None:
+            self.condition_scale = nn.Linear(condition_dim, num_experts)
+            self.condition_shift = nn.Linear(condition_dim, num_experts)
+        else:
+            self.condition_scale = None
+            self.condition_shift = None
+
+        if self.use_pre_routing_bias:
+            self.global_bias_net = nn.Sequential(
+                nn.Linear(num_experts, num_experts),
+                nn.GELU(),
+                nn.Linear(num_experts, num_experts),
+            )
+
+    def forward(self, x, condition=None):
+        final_scores = self.base_router(x)
+
+        if self.use_pre_routing_bias:
+            initial_distribution = th.mean(final_scores, dim=0)
+            correction_bias = self.global_bias_net(initial_distribution)
+            final_scores = final_scores + correction_bias.unsqueeze(0)
+
+        if condition is not None and self.condition_scale is not None:
+            scale = 1 + self.condition_scale(condition).unsqueeze(1)
+            shift = self.condition_shift(condition).unsqueeze(1)
+            final_scores = scale * final_scores + shift
+
+        return th.softmax(final_scores, dim=-1)
+
+
+class MoEBlock(TimestepBlock):
+    """Optional Mixture-of-Experts block retained for ablation compatibility."""
+
+    def __init__(
+        self,
+        channels,
+        emb_channels,
+        dropout,
+        out_channels=None,
+        use_scale_shift_norm=False,
+        use_checkpoint=False,
+        num_experts=4,
+        condition_dim=256,
+        top_k=1,
+        capacity_factor=None,
+        use_pre_routing_bias=False,
+        **kwargs,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.emb_channels = emb_channels
+        self.out_channels = out_channels or channels
+        self.use_checkpoint = use_checkpoint
+        self.num_experts = num_experts
+        self.use_scale_shift_norm = use_scale_shift_norm
+        self.top_k = min(top_k, num_experts)
+        self.capacity_factor = capacity_factor
+        self.use_pre_routing_bias = use_pre_routing_bias
+
+        if self.use_scale_shift_norm:
+            self.in_norm = nn.GroupNorm(num_groups=min(32, channels), num_channels=channels)
+            self.emb_to_scale_shift = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(emb_channels, 2 * channels),
+            )
+        else:
+            self.emb_to_gate = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(emb_channels, channels),
+            )
+
+        self.experts = nn.ModuleList(
+            [ExpertMLP(channels, emb_channels, dropout) for _ in range(num_experts)]
+        )
+        self.heatmap_processor = HeatmapProcessor(condition_dim)
+        self.router = Router(
+            channels,
+            num_experts,
+            condition_dim,
+            use_pre_routing_bias=self.use_pre_routing_bias,
+        )
+
+        if self.channels != self.out_channels:
+            self.proj = nn.Conv2d(channels, self.out_channels, 1)
+            self.skip = nn.Conv2d(channels, self.out_channels, 1)
+        else:
+            self.proj = nn.Identity()
+            self.skip = nn.Identity()
+
+    @th.no_grad()
+    def _capacity_for(self, n_tokens):
+        if self.capacity_factor is None:
+            return None
+        base = math.ceil(n_tokens / self.num_experts)
+        return max(1, int(math.ceil(self.capacity_factor * base)))
+
+    def forward(self, x, emb, heatmap=None):
+        bsz, channels, height, width = x.shape
+        n_tokens = bsz * height * width
+
+        if self.use_scale_shift_norm:
+            h = self.in_norm(x)
+            scale, shift = self.emb_to_scale_shift(emb).chunk(2, dim=1)
+            h = h * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+        else:
+            gate = th.sigmoid(self.emb_to_gate(emb))
+            h = x * gate[:, :, None, None]
+
+        h_tokens = h.permute(0, 2, 3, 1).reshape(n_tokens, channels)
+        x_router_tokens = x.permute(0, 2, 3, 1).reshape(n_tokens, channels)
+
+        condition = None
+        if heatmap is not None:
+            cond_img = self.heatmap_processor(heatmap)
+            condition = cond_img.repeat_interleave(height * width, dim=0)
+
+        weights = self.router(x_router_tokens, condition)
+        topk_vals, topk_idx = th.topk(weights, k=self.top_k, dim=-1)
+        topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-9)
+
+        out_tokens = th.zeros_like(h_tokens)
+        per_expert_capacity = self._capacity_for(n_tokens)
+
+        for expert_idx, expert in enumerate(self.experts):
+            sel_mask = topk_idx == expert_idx
+            positions = th.nonzero(sel_mask, as_tuple=False)
+            if positions.numel() == 0:
+                continue
+
+            token_ids = positions[:, 0]
+            kpos = positions[:, 1]
+
+            if per_expert_capacity is not None and token_ids.numel() > per_expert_capacity:
+                with th.no_grad():
+                    weights_for_expert = topk_vals[token_ids, kpos]
+                    top_sel = th.topk(weights_for_expert, k=per_expert_capacity, dim=0).indices
+                token_ids = token_ids[top_sel]
+                kpos = kpos[top_sel]
+
+            inputs_e = h_tokens[token_ids]
+            w_e = topk_vals[token_ids, kpos].unsqueeze(1)
+            out_e = expert(inputs_e)
+            out_tokens.index_add_(0, token_ids, out_e * w_e)
+
+        out = out_tokens.reshape(bsz, height, width, channels).permute(0, 3, 1, 2)
+        out = self.proj(out)
+        return out + self.skip(x)
 
 class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
@@ -719,7 +923,6 @@ class UNetModel(nn.Module):
             elif name == 'resnet':
                 return ResBlock
             elif name == 'moe':
-                from moe_block import MoEBlock
                 print("Using MoEBlock with pre_routing_bias =", use_pre_routing_bias)
                 return functools.partial(MoEBlock, use_pre_routing_bias=use_pre_routing_bias)
                 
