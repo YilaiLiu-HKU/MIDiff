@@ -37,7 +37,7 @@ ckpt/midiff/
 The paper checkpoint is hosted on Hugging Face and is not stored in Git. Download it with:
 
 ```bash
-huggingface-cli download no-pressure/MIDiff ckpt/midiff/ema_0.9999_048000.pt --local-dir .
+huggingface-cli download YilaiLiu-HKU/MIDiff ckpt/midiff/ema_0.9999_048000.pt --local-dir .
 ```
 
 ## Samples
@@ -100,6 +100,15 @@ RUN_DOWNSTREAM=1 bash run_scripts/run_all_midiff_exp.sh
 - `sample_midiff.py`: diffusion sampling entrypoint.
 - `exp/evaluate_generation_metrics.py`: generation metrics.
 - `exp/run_downstream_cross_variable.py`: downstream utility tasks.
+
+## Optional Experiments
+
+The main paper pipeline uses `train_midiff.py` and `sample_midiff.py`. The remaining optional experiment code is kept for architecture comparisons:
+
+- `run_scripts/train_ablation.sh`: interactive launcher for VAE, GAN, or MIDiff comparison runs with matched C-GASF settings.
+- `run_scripts/run_ablation.sh`: prints the corresponding VAE, GAN, and MIDiff training commands.
+- `scripts/vae_train.py` and `scripts/vae_sample.py`: VAE baseline using the same C-GASF image interface.
+- `scripts/gan_train.py` and `scripts/gan_sample.py`: GAN baseline using the same C-GASF image interface.
 
 ## Citation
 
