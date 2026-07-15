@@ -320,6 +320,7 @@ def main():
         step += 1
 
 def create_argparser():
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     defaults = model_and_diffusion_defaults()
     defaults.pop('image_size', None) # 移除旧的 image_size
     
@@ -332,9 +333,9 @@ def create_argparser():
         b2=0.999,
         batch_size=32,
         lr_anneal_steps=300000, 
-        save_dir="/data/yilai/MiDiff/ckpt/ckpt/tiff_log_thr_gan_ablation_256x160",
+        save_dir=os.path.join(repo_root, "ckpt", "cgasf_ablation_gan_ablation_256x160"),
         latent_dim=256, 
-        data_dir="/home/yilai/projects/poster/NetDiffus/tiff_log_thr",
+        data_dir=os.path.join(repo_root, "cgasf_ablation"),
         # 保持与您的扩散模型指令一致
         num_channels=128, 
         num_res_blocks=3, 

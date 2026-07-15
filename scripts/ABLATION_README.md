@@ -50,7 +50,7 @@
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 python scripts/ablation_experiment.py \
-    --data_dir /home/yilai/projects/poster/NetDiffus/tiff_log \
+    --data_dir ./cgasf \
     --image_size 256 \
     --num_channels 128 \
     --num_res_blocks 3 \
@@ -62,7 +62,6 @@ CUDA_VISIBLE_DEVICES=7 python scripts/ablation_experiment.py \
     --batch_size 32 \
     --save_dir ablation_experiments \
     --special_weight 1.0 \
-    --cos_weight 0.01 \
     --save_interval 1000 \
     --ablation_config baseline \
     --triplet_version v1 \
@@ -72,8 +71,8 @@ CUDA_VISIBLE_DEVICES=7 python scripts/ablation_experiment.py \
 ### 批量运行所有实验
 
 ```bash
-chmod +x scripts/run_ablation_experiments.sh
-./scripts/run_ablation_experiments.sh
+chmod +x run_scripts/run_ablation_experiments.sh
+./run_scripts/run_ablation_experiments.sh
 ```
 
 ## 参数说明

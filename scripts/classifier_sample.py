@@ -1,5 +1,5 @@
 """
-Like image_sample.py, but use a noisy image classifier to guide the sampling
+Like sample_midiff.py, but use a noisy image classifier to guide the sampling
 process towards more realistic images.
 """
 

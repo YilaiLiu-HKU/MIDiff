@@ -1,67 +1,99 @@
-# NetDiffus
-This is repository of the paper [NetDiffus: Network Traffic Generation by Diffusion Models through Time-Series Imaging](https://arxiv.org/abs/2310.04429) .
+# MIDiff
 
-# Requirements
+Official implementation of **MIDiff: Tackling Sparsity and Imbalance in Mobile Usage Generation via Multivariate-Imaging Diffusion**.
 
-- Python 3.9
-- guided-diffusion
-- torch
-- tqdm
-- blobfile>=1.0.5
+MIDiff is a diffusion-based framework for generating user-level mobile usage traces. It converts sparse multivariate traces into Cross-Gramian Angular Sum Field (C-GASF) images, trains a Triple-Attention U-Net diffusion model in the image space, and converts generated images back to mobile usage sequences.
 
-# About NetDiffus
+<p align="center">
+  <img src="pics/framework2_readme.png" width="95%" alt="MIDiff framework">
+</p>
 
-While Machine-Learning based network data analytics are now common-
-place for many networking solutions, nonetheless, limited access to appropriate
-networking data has been an enduring challenge for many networking problems.
-Causes for lack of such data include complexity of data gathering, commercial
-sensitivity, as well as privacy and regulatory constraints. To overcome these
-challenges, we present a Diffusion-Model (DM) based end-to-end framework,
-NetDiffus, for synthetic network traffic generation which is one of the emerg-
-ing topics in networking and computing system. NetDiffus first converts one-
-dimensional time-series network traffic into two-dimensional images, and then
-synthesizes representative images for the original data. We demonstrate that
-NetDiffus outperforms the state-of-the-art traffic generation methods based on
-Generative Adversarial Networks (GANs) by providing 66.4% increase in the
-fidelity of the generated data and an 18.1% increase in downstream machine
-learning tasks. We evaluate NetDiffus on seven diverse traffic traces and show
-that utilizing synthetic data significantly improves several downstream ML tasks
-including traffic fingerprinting, anomaly detection and traffic classification.
+## Installation
 
-<img src="img.png">
-
-We have released the data for the purpose of re-implementing and testing the algoirhtm [here](https://drive.google.com/drive/folders/1qoNrghez1vffgApGe9SnUXSzV9fx6unz?usp=sharing). This dataset is not the complete one. Complete dataset will be available upon the request.
-
-Run the command below to convert the extracted features in the csv files to GASF images.
-```commandline
- python gasf_conversion.py
+```bash
+git clone https://github.com/YilaiLiu-HKU/MIDiff.git
+cd MIDiff
+python -m pip install -e .
+python -m pip install numpy pandas scipy scikit-learn matplotlib seaborn openpyxl tqdm blobfile
 ```
 
-    Data structure for data generationn is as follows:
-    - Youtube
-        -vid1
-            -vid1_1.png
-            -vid1_2.png
-            - ...
-        -vid2
-            - ...
-        - ...
+The code is based on OpenAI Guided Diffusion and PyTorch.
 
-# Run Scripts
+## Dataset
 
-To start the training process you can run the following command:
+The original data is available from the [Tsinghua App Usage Dataset](https://fi.ee.tsinghua.edu.cn/appusage/). This repository does not redistribute the dataset; please follow the original dataset terms.
 
-```commandline
- python scripts/image_train.py --data_dir <dataset_path> --image_size 128 --num_channels 128 --num_res_blocks 3 --diffusion_steps 1000 --noise_schedule cosine --learn_sigma True --class_cond True --rescale_learned_sigmas False --rescale_timesteps False --lr 1e-4 --batch_size 4
+Place processed data and checkpoints under:
+
+```text
+data/
+  our.csv
+  dataset_original_npz/all_users_data_with6cluster.npz
+cgasf/
+ckpt/midiff/
 ```
 
-To generate the data you can run the following command:
+`data/our.csv` is the real/reference CSV in flattened `[192, 3]` eval format, and `cgasf/` contains C-GASF training images.
 
-```commandline
-  python scripts/image_sample.py --model_path <trained_model_path> --image_size 128 --num_channels 128 --num_res_blocks 3 --diffusion_steps 1000 --noise_schedule cosine --learn_sigma True --class_cond True --rescale_learned_sigmas False --rescale_timesteps False
+## Usage
+
+Train MIDiff:
+
+```bash
+bash run_scripts/train_midiff.sh
 ```
 
-You can run the classifier.py to get the classification results.
+Sample C-GASF images from the paper checkpoint:
 
-# Acknowledgements
-This code is developed on the OpenAI's [Guided Diffusion](https://github.com/openai/guided-diffusion).
+```bash
+bash run_scripts/sample_midiff.sh
+```
+
+Convert the sampled NPZ into eval-format CSV:
+
+```bash
+bash run_scripts/infer_npz_to_eval_csv.sh
+```
+
+Evaluate generated traces:
+
+```bash
+bash run_scripts/evaluate_midiff_real.sh
+```
+
+Run the default experiment pipeline:
+
+```bash
+bash run_scripts/run_all_midiff_exp.sh
+```
+
+Downstream tasks are disabled by default because they are more expensive. Enable them with:
+
+```bash
+RUN_DOWNSTREAM=1 bash run_scripts/run_all_midiff_exp.sh
+```
+
+## Key Scripts
+
+- `gasf_cross_conversion.py`: C-GASF forward transform.
+- `gasf_cross_conversion_inverse.py`: inverse C-GASF recovery.
+- `train_midiff.py`: diffusion training entrypoint.
+- `sample_midiff.py`: diffusion sampling entrypoint.
+- `exp/evaluate_generation_metrics.py`: generation metrics.
+- `exp/run_downstream_cross_variable.py`: downstream utility tasks.
+
+## Citation
+
+If you use this code, please cite:
+
+```bibtex
+@misc{midiff2026,
+  title = {MIDiff: Tackling Sparsity and Imbalance in Mobile Usage Generation via Multivariate-Imaging Diffusion},
+  author = {Yilai Liu and Shiyuan Zhang and Hongyang Du},
+  year = {2026}
+}
+```
+
+## Acknowledgements
+
+This implementation builds on OpenAI Guided Diffusion.

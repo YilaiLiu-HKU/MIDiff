@@ -5,7 +5,8 @@ from PIL import Image
 from matplotlib import cm
 
 # 加载数据
-save_dir=r'/home/yilai/poster/NetDiffus/ckpt/orginal'
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+save_dir = os.path.join(REPO_ROOT, "ckpt", "orginal")
 file='emamodel008000.pt_samples_3000x320x160x3.npz'
 data = np.load(os.path.join(save_dir,file),allow_pickle=True)  # 替换为你的 npz 文件路径
 arr = data['arr_0']  # 如果你的 npz 中的键不是 'arr'，请替换

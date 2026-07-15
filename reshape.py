@@ -65,9 +65,10 @@ def split_into_three_dimensions(data):
     dim2 = data[:, n_features:2*n_features]
     dim3 = data[:, 2*n_features:]
     return dim1, dim2, dim3
-data_path='/home/yilai/poster/tts-gan/output_flattened.csv'
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+data_path = os.path.join(REPO_ROOT, "data", "tts_gan_output_flattened.csv")
 use_pt=False
-save_dir='/home/yilai/poster/NetDiffus/downstream/dataset/'
+save_dir = os.path.join(REPO_ROOT, "downstream", "dataset")
 save_name='ttsGAN'
 os.makedirs(save_dir,exist_ok=True)
 if use_pt:
@@ -84,7 +85,7 @@ print(s3.max())
 s1[minus0_s1]=0
 
 """np.savez(
-        '/home/yilai/poster/NetDiffus/our_traces.npz',
+        os.path.join(REPO_ROOT, 'our_traces.npz'),
         app_Traffic=file['app_traces'],
         POI=file['poi_traces'],
     )"""

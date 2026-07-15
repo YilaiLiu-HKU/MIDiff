@@ -184,6 +184,7 @@ def main():
     logger.log("GAN sampling complete")
 
 def create_argparser():
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     defaults = model_and_diffusion_defaults()
     defaults.pop('image_size', None)
     
@@ -192,7 +193,7 @@ def create_argparser():
         image_size_w=160,
         num_samples=3000,
         batch_size=32,
-        save_dir="/data/yilai/MiDiff/ckpt/ckpt/tiff_log_thr_gan_ablation_256x160",
+        save_dir=os.path.join(repo_root, "ckpt", "cgasf_ablation_gan_ablation_256x160"),
         latent_dim=256, 
         model_path="", # GAN Generator (G) 模型 checkpoints 路径
         # 保持与您的扩散模型指令一致

@@ -3,8 +3,8 @@
 ## 训练命令对应的模型配置
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 python scripts/image_train.py \
-  --data_dir /home/yilai/projects/poster/NetDiffus/tiff_log \
+CUDA_VISIBLE_DEVICES=7 python train_midiff.py \
+  --data_dir ./cgasf \
   --image_size 256 \
   --num_channels 128 \
   --num_res_blocks 3 \
@@ -16,9 +16,8 @@ CUDA_VISIBLE_DEVICES=7 python scripts/image_train.py \
   --rescale_timesteps False \
   --lr 5e-4 \
   --batch_size 32 \
-  --save_dir ckpt/tiff_log \
+  --save_dir ckpt/cgasf \
   --special_weight 1.0 \
-  --cos_weight 0.01 \
   --attention_type triple \
   --save_interval 1000
 ```

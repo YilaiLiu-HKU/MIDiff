@@ -1,6 +1,6 @@
 """
 Generate a large batch of samples from a super resolution model, given a batch
-of samples from a regular model from image_sample.py.
+of samples from a regular model from sample_midiff.py.
 """
 
 import argparse

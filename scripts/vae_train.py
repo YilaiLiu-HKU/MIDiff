@@ -294,6 +294,7 @@ def main():
         step += 1
 
 def create_argparser():
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     defaults = model_and_diffusion_defaults()
     defaults.pop('image_size', None)
     
@@ -303,10 +304,10 @@ def create_argparser():
         lr=1e-4, 
         batch_size=32,
         lr_anneal_steps=300000, 
-        save_dir="/data/yilai/MiDiff/ckpt/ckpt/tiff_log_thr_vae_ablation_256x160",
+        save_dir=os.path.join(repo_root, "ckpt", "cgasf_ablation_vae_ablation_256x160"),
         latent_dim=256, 
         kl_weight=1e-6,
-        data_dir="/home/yilai/projects/poster/NetDiffus/tiff_log_thr",
+        data_dir=os.path.join(repo_root, "cgasf_ablation"),
         num_channels=128, 
         num_res_blocks=3, 
         attention_type='triple', 
