@@ -128,4 +128,4 @@ If you use this code, please cite:
 
 ## Acknowledgements
 
-This implementation builds on OpenAI Guided Diffusion.
+Big thanks to [openai/guided-diffusion](https://github.com/openai/guided-diffusion).
