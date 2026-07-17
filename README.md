@@ -128,4 +128,4 @@ If you use this code, please cite:
 
 ## Acknowledgements
 
-Big thanks to [openai/guided-diffusion](https://github.com/openai/guided-diffusion).
+Big thanks to [openai/guided-diffusion](https://github.com/openai/guided-diffusion) and [Nirhoshan/NetDiffus](https://github.com/Nirhoshan/NetDiffus).
