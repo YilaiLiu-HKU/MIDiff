@@ -1,8 +1,6 @@
 # MIDiff
 
-Official implementation of **MIDiff: Tackling Sparsity and Imbalance in Mobile Usage Generation via Multivariate-Imaging Diffusion**.
-
-[Paper](https://arxiv.org/abs/2607.14249)
+Official implementation of **[MIDiff: Tackling Sparsity and Imbalance in Mobile Usage Generation via Multivariate-Imaging Diffusion](https://arxiv.org/abs/2607.14249)**.
 
 MIDiff is a diffusion-based framework for generating user-level mobile usage traces. It converts sparse multivariate traces into Cross-Gramian Angular Sum Field (C-GASF) images, trains a Triple-Attention U-Net diffusion model in the image space, and converts generated images back to mobile usage sequences.
 
