@@ -2,6 +2,8 @@
 
 Official implementation of **MIDiff: Tackling Sparsity and Imbalance in Mobile Usage Generation via Multivariate-Imaging Diffusion**.
 
+[Paper](https://arxiv.org/abs/2607.14249)
+
 MIDiff is a diffusion-based framework for generating user-level mobile usage traces. It converts sparse multivariate traces into Cross-Gramian Angular Sum Field (C-GASF) images, trains a Triple-Attention U-Net diffusion model in the image space, and converts generated images back to mobile usage sequences.
 
 <p align="center">
@@ -115,10 +117,14 @@ The main paper pipeline uses `train_midiff.py` and `sample_midiff.py`. The remai
 If you use this code, please cite:
 
 ```bibtex
-@misc{midiff2026,
-  title = {MIDiff: Tackling Sparsity and Imbalance in Mobile Usage Generation via Multivariate-Imaging Diffusion},
-  author = {Yilai Liu and Shiyuan Zhang and Hongyang Du},
-  year = {2026}
+@misc{liu2026midifftacklingsparsityimbalance,
+      title={MIDiff: Tackling Sparsity and Imbalance in Mobile Usage Generation via Multivariate-Imaging Diffusion}, 
+      author={Yilai Liu and Shiyuan Zhang and Hongyang Du},
+      year={2026},
+      eprint={2607.14249},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2607.14249}, 
 }
 ```
 
